@@ -1,0 +1,111 @@
+AGENT.TXT - Instrucciones para un agente (IA o persona) que trabaje en este proyecto
+======================================================================================
+
+PROYECTO
+  Formateo de EDRs/CDRs (CDR_EXT) de ICT para interconexion Guatemala, septiembre 2026.
+  Convierte los CSV del extract de ICT a CSV legibles (formato de la tabla DBF de
+  referencia) y deja los valores en quetzales (GTQ) con IVA incluido.
+
+ARCHIVOS
+  formatear_cdr.py       Script principal (Python 2.7.5, solo libreria estandar).
+  config.txt             Configuracion (carpetas, exclusiones, conversion a GTQ).
+  ejecutar_formatear.sh  Lanzador bash: busca Python 2, ejecuta el script, log diario,
+                         y programa/quita la ejecucion diaria en cron (variable HORAS).
+  CONTEXTO_SCRIPT.md     Documentacion: contexto, que es y que hace el script.
+  agent.txt              Este archivo.
+
+REGLAS NO NEGOCIABLES
+  1. Compatibilidad Python 2.7.5. El servidor NO tiene internet ni paquetes extra.
+     Solo libreria estandar. Nada de f-strings, type hints, pathlib, print con
+     argumentos especiales ni sintaxis de Python 3. Usar "except X as e",
+     "ConfigParser" (no "configparser"), csv abierto en modo 'rb'/'wb'.
+  2. Los archivos de ENTRADA son originales: solo se leen. Nunca modificar, mover,
+     renombrar ni borrar nada en ENTRADA. Se escribe solo en SALIDA y en logs.
+  3. El nombre de cada archivo de salida es igual al de entrada (no renombrar).
+  4. Escritura segura: primero a .tmp y luego os.rename; si falla, borrar el .tmp.
+  5. No inventar datos de negocio (tipo de cambio, reglas). Si falta un dato, preguntar.
+  6. No cambiar el config del usuario si no lo pidio. El config se modifica solo para
+     lo solicitado; el resto de valores queda igual.
+  7. Responder en espanol, breve y claro. El usuario es operativo, no desarrollador.
+
+FORMATO DE ENTRADA (CDR_EXT de ICT)
+  Lineas: AARHDR, AARTAB, AARCOL (nombres de columna), AARSIZ, AARTYP, AARDEC,
+  luego registros que empiezan con coma (primer campo vacio), AARCNT,<n>, AARTRA.
+  Columnas: PARAMETER_MATRIX(*), RATING_COMPONENT, ANUM, BNUM, EVENT_START_DATE,
+  EVENT_START_TIME (HHMMSScc), EVENT_DURATION, AMOUNT, INCOMING_PATH, OUTGOING_PATH,
+  CURRENCY (USD o GTQ), USER_SUMMARISATION.
+  Nombre de archivo: CDR_EXT_J-..._P-..._BLP-..._FRAN-<franquicia>_NOP-<operador>_
+  SDIR-<R|S>_PGRP-ITX_BMET-I_<n>.CSV
+  Carpetas: /ITC/EDRS_GT/EDRS_09_2026/ENTRADA/{CABGUA, CLARO/SDIR-R_SALIENTE,
+  CLARO/SDIR-S_ENTRANTE, CLAROXT, TELGUA, DESCARGA}. DESCARGA son reportes, no CDR
+  (se excluye en el config y ademas el script omite lo que no empiece con AARHDR).
+
+FORMATO DE SALIDA (modo tabla)
+  Cod_tra,Tel_ori,Tel_des,Fec_lla,Hor_lla,Seg_rea,Val_lla,Rut_ent,Rut_sal
+  - Se omite la columna "*".
+  - Cod_tra sin ceros a la izquierda (0092 -> 92).
+  - Hor_lla HHMMSS (10415900 -> 104159).
+  - Seg_rea sin decimales (625.00000000000 -> 625).
+  - Val_lla sin ceros finales; los convertidos van truncados a 5 decimales.
+
+REGLAS DE NEGOCIO (confirmadas por Ronaldo, area de facturacion/interconexion)
+  - Todos los valores deben salir en quetzales (GTQ) con IVA incluido.
+  - ICT entrega casi todo en USD con IVA incluido: solo se aplica el tipo de cambio
+    del mes. NO se suma ni se resta IVA.
+  - Tipo de cambio septiembre 2026: 7.63856 (usar los 5 decimales). Cambia cada mes.
+  - Se TRUNCA (no se redondea). El DBF guarda 4 decimales; el CSV lleva 5 si se puede.
+  - ATEL: todas las transacciones vienen en USD -> se convierten todas.
+  - COMCEL: la mayoria viene en USD, pero estas YA VIENEN EN GTQ y no se tocan:
+      * TELGUA: transaccion 83 solo entrante; transaccion 94 entrante y saliente.
+      * CLARO: transaccion 94 entrante y saliente.
+  - Transaccion = Cod_tra = RATING_COMPONENT (se compara sin ceros: 0094 = 94).
+  - Ejemplo de validacion: 0.01764 USD x 7.63856 = 0.1347441984 -> 0.13474
+    (en el DBF de 4 decimales: 0.1347).
+
+COMO DECIDE EL SCRIPT SI CONVIERTE UN REGISTRO (convertir_a_gtq = si)
+  1. Moneda distinta de USD/GTQ -> error en ese archivo (no se genera salida).
+  2. Coincide con excepciones_gtq (franquicia:operador:transaccion:sentido) -> NO se
+     convierte (ya esta en GTQ). Si su moneda decia USD, queda como AVISO en el log.
+  3. Moneda USD -> monto x tipo_cambio, truncado a decimales_monto.
+  4. Moneda GTQ sin regla -> no se convierte y queda como AVISO (revisar).
+  La franquicia/operador/sentido salen del NOMBRE del archivo. Sentido por la letra
+  SDIR: R = entrante, S = saliente (configurable en sentido_sdir_r / sentido_sdir_s).
+  Se ve en la estructura de carpetas de CLARO: los archivos SDIR-S estan en
+  SDIR-R_SALIENTE y los SDIR-R en SDIR-S_ENTRANTE.
+
+PUNTOS ABIERTOS (confirmar con Ronaldo antes de dar por cerrado)
+  - Sentido: confirmar que SDIR-R = entrante y SDIR-S = saliente. Solo afecta a la
+    excepcion de la transaccion 83 de TELGUA.
+  - CABGUA -> CLARO viene en GTQ en el archivo de muestra y NO esta en la lista de
+    excepciones de Ronaldo. El script no lo convierte y lo reporta como AVISO.
+  - Evitar doble conversion: confirmar que el extract de ICT NO aplica ya el tipo de
+    cambio (los CSV de muestra traen USD, por ejemplo 0.01764 por 63 s).
+  - Columna de moneda: el formato de la imagen no la lleva (opciones incluir_moneda
+    e incluir_resumen existen en el script y estan apagadas por defecto).
+  - Comparar el resultado contra el DBF de muestra (2026090200_1D.xlsx, TELGUA ->
+    ATEL) cuando llegue: ese archivo aun no se ha recibido.
+  - DBF de muestra: Cod_tra salia 0 en FoxPro con valores de 4 digitos (1801); el
+    campo del DBF probablemente es muy angosto. Es de la tabla, no del script.
+
+COMO PROBAR (aqui no hay Python 2)
+  1. Crear una carpeta de prueba con CSV de muestra (USD, GTQ, COMCEL 83/94, un
+     archivo sin AARHDR, uno con moneda EUR).
+  2. Python 2 no suele estar disponible en el entorno de desarrollo. Se puede probar
+     con Python 3 usando una copia de prueba (NO la de produccion) cambiando solo:
+       import ConfigParser         -> import configparser as ConfigParser
+       open(..., 'rb')             -> open(..., 'r', newline='')
+       open(ruta_tmp, 'wb')        -> open(ruta_tmp, 'w', newline='')
+  3. Comprobar: montos (calcular a mano con Decimal), excepciones sin alterar,
+     originales sin cambios (md5 antes/despues), sin .tmp sobrantes, y log.
+  4. En el servidor real, primero probar con UNA central y revisar un par de montos.
+
+LOG
+  logs/formatear_cdr_AAAAMMDD_HHMMSS.log: fecha/hora, carpetas y archivos procesados,
+  registros convertidos por archivo, DETALLE por franquicia/operador/sentido/
+  transaccion/moneda, AVISOS de moneda y lista de ERRORES.
+  El bash guarda ademas logs/formatear_AAAAMMDD.log con la salida en pantalla.
+
+RECORDATORIOS PARA CADA MES
+  - Cambiar tipo_cambio en config.txt y las carpetas (EDRS_MM_AAAA) de entrada/salida.
+  - Revisar el DETALLE y los AVISOS del log antes de entregar los archivos.
+  - Si ICT agrega transacciones que ya vengan en GTQ, agregarlas a excepciones_gtq.

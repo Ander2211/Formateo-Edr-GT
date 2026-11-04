@@ -1,0 +1,52 @@
+[carpetas]
+; Carpetas de entrada con los CDR originales. Pueden ser una o varias, separadas
+; por coma (una por linea, con sangria al inicio de las lineas siguientes).
+; Cada una se recorre con todas sus subcarpetas. Los originales solo se leen.
+; Con varias carpetas, en SALIDA se crea una carpeta por cada una, con su mismo
+; nombre (CABGUA, CLARO, CLAROXT, TELGUA...). Con una sola carpeta, su contenido
+; se replica directamente en SALIDA.
+entrada = /ITC/EDRS_GT/EDRS_09_2026/ENTRADA/CABGUA,
+    /ITC/EDRS_GT/EDRS_09_2026/ENTRADA/CLARO,
+    /ITC/EDRS_GT/EDRS_09_2026/ENTRADA/CLAROXT,
+    /ITC/EDRS_GT/EDRS_09_2026/ENTRADA/TELGUA
+; Carpeta raiz de salida. Se crea si no existe. El nombre de cada archivo se conserva.
+salida = /ITC/EDRS_GT/EDRS_09_2026/SALIDA
+; Subcarpetas que NO se deben procesar (nombres separados por coma, sin importar
+; mayusculas/minusculas). Aplica dentro de cada carpeta de entrada.
+excluir_carpetas = DESCARGA
+
+[archivos]
+; Extensiones a procesar (separadas por coma, sin importar mayusculas)
+extensiones = .csv
+; Si el archivo ya existe en SALIDA: si = lo reemplaza, no = lo omite
+sobrescribir = si
+
+[formato]
+; Separador de columnas del CSV de salida: coma, punto_y_coma, tab o barra
+; (si Excel abre todo en una sola columna, use punto_y_coma)
+separador = coma
+
+; ---------------------------------------------------------------------------
+; CONVERSION A QUETZALES (los montos de ICT ya incluyen IVA: NO se suma IVA)
+; ---------------------------------------------------------------------------
+; si = los registros en USD se multiplican por tipo_cambio y el resultado se
+; TRUNCA (no se redondea) a decimales_monto decimales.
+convertir_a_gtq = si
+; Quetzales por 1 dolar. CAMBIAR CADA MES (aqui: septiembre 2026).
+tipo_cambio = 7.63856
+; Decimales de Val_lla en los registros convertidos (el DBF guarda 4).
+decimales_monto = 5
+
+; Registros que YA vienen en quetzales desde ICT: no se convierten ni se alteran.
+; Formato: FRANQUICIA:OPERADOR:TRANSACCION:SENTIDO  (entrante, saliente o * = ambos)
+; Franquicia y operador son los del nombre del archivo (FRAN-TELGUA_NOP-COMCEL).
+; Una por linea, con sangria al inicio de las lineas siguientes.
+excepciones_gtq = TELGUA:COMCEL:83:entrante,
+    TELGUA:COMCEL:94:*,
+    CLARO:COMCEL:94:*
+
+; Sentido segun la letra SDIR- del nombre del archivo (SDIR-R / SDIR-S).
+; Por la estructura de carpetas: SDIR-R = entrante, SDIR-S = saliente.
+; CONFIRMAR: solo afecta a la excepcion de la transaccion 83 de TELGUA.
+sentido_sdir_r = entrante
+sentido_sdir_s = saliente
