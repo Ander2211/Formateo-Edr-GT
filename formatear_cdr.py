@@ -28,8 +28,19 @@ Los archivos originales en ENTRADA solo se leen; nunca se modifican.
 
 Compatible con Python 2.7.5 (solo libreria estandar, sin internet).
 
+Version optimizada + multiprocessing (misma logica, mismas salidas):
+  - Cada archivo se procesa en un proceso aparte (multiprocessing.Pool).
+  - Solo el proceso principal escribe el log y acumula las estadisticas, en el
+    mismo orden de siempre (carpetas y archivos en orden alfabetico).
+  - Opcional en [archivos] del config:  procesos = auto | 1 | 2 | 4 ...
+      auto = cantidad de CPU de la maquina (por defecto)
+      1    = sin multiprocessing (modo secuencial)
+  - Mejoras por archivo: plan de columnas preparado una vez, cache de codigo/
+    excepcion/moneda, quantum de Decimal calculado una vez y escritura por
+    bloques con buffer grande.
+
 Uso:
-    python formatear_cdr.py [ruta_config.txt]
+    python formatear_cdr_mp.py [ruta_config.txt]
 
 'entrada' en el config puede ser una carpeta o varias (separadas por coma).
 Cada carpeta se recorre con sus subcarpetas y se escribe en SALIDA conservando el
@@ -48,6 +59,7 @@ import sys
 import csv
 import time
 import ConfigParser
+import multiprocessing
 from decimal import Decimal, ROUND_DOWN
 
 
@@ -64,6 +76,13 @@ SEPARADORES = {
 
 # FRAN-TELGUA_NOP-COMCEL_SDIR-R  ->  franquicia, operador, letra de sentido
 PATRON_NOMBRE = re.compile(r'FRAN-([A-Za-z0-9]+)_NOP-([A-Za-z0-9]+)_SDIR-([RSrs])')
+
+# Tamanos de buffer / bloque
+BUFFER_ARCHIVO = 1024 * 1024
+BLOQUE_FILAS = 5000
+
+# Opciones disponibles dentro de cada proceso trabajador
+_OPC = None
 
 
 # ----------------------------------------------------------------------------
@@ -138,6 +157,23 @@ def leer_sentido(cfg, opcion, defecto):
     if valor not in ('entrante', 'saliente'):
         raise ValueError("%s invalido '%s'. Use: entrante o saliente" % (opcion, valor))
     return valor
+
+
+def leer_procesos(texto):
+    """'auto' = cantidad de CPU; o un entero >= 1."""
+    t = texto.strip().lower()
+    if t in ('', 'auto'):
+        try:
+            return max(1, multiprocessing.cpu_count())
+        except NotImplementedError:
+            return 1
+    try:
+        n = int(t)
+        if n < 1:
+            raise ValueError()
+    except ValueError:
+        raise ValueError("procesos invalido '%s'. Use: auto o un entero >= 1" % texto)
+    return n
 
 
 def leer_config(ruta_config, base_dir):
@@ -218,6 +254,11 @@ def leer_config(ruta_config, base_dir):
             dec_monto = 5
         excepciones = leer_excepciones(obtener(cfg, 'formato', 'excepciones_gtq', ''))
 
+    # Quantum de Decimal calculado una sola vez (antes se recalculaba por registro)
+    quantum = Decimal(1).scaleb(-dec_monto) if dec_monto is not None else None
+
+    procesos = leer_procesos(obtener(cfg, 'archivos', 'procesos', 'auto'))
+
     return {
         'entradas': entradas,
         'envolver': envolver,
@@ -226,9 +267,11 @@ def leer_config(ruta_config, base_dir):
         'excluir': [x.upper() for x in a_lista(obtener(cfg, 'carpetas', 'excluir_carpetas', ''))],
         'extensiones': [x.lower() for x in a_lista(obtener(cfg, 'archivos', 'extensiones', '.csv'))],
         'sobrescribir': a_bool(obtener(cfg, 'archivos', 'sobrescribir', 'si')),
+        'procesos': procesos,
         'separador': SEPARADORES[nombre_sep],
         'modo': modo,
         'dec_monto': dec_monto,
+        'quantum': quantum,
         'convertir': convertir,
         'tipo_cambio': tipo_cambio,
         'excepciones': excepciones,
@@ -252,17 +295,19 @@ def _es_numero(v):
 
 def quitar_ceros_finales(v):
     """625.00000000000 -> 625 ; 0.17500000000 -> 0.175 (no redondea)."""
-    if '.' in v:
-        ent, dec = v.split('.', 1)
-    else:
-        ent, dec = v, ''
-    dec = dec.rstrip('0')
-    return ent if not dec else ent + '.' + dec
+    if '.' not in v:
+        return v
+    return v.rstrip('0').rstrip('.')
 
 
 def truncar(valor, decimales):
     """Trunca (no redondea) un Decimal a N decimales y quita ceros finales."""
     q = Decimal(1).scaleb(-decimales)
+    return quitar_ceros_finales(format(valor.quantize(q, rounding=ROUND_DOWN), 'f'))
+
+
+def truncar_q(valor, q):
+    """Igual que truncar() pero con el quantum ya calculado."""
     return quitar_ceros_finales(format(valor.quantize(q, rounding=ROUND_DOWN), 'f'))
 
 
@@ -303,9 +348,9 @@ def fmt_monto(valor, opc):
     v = valor.strip()
     if not _es_numero(v):
         return v
-    n = opc['dec_monto']
-    if n is not None:
-        return truncar(Decimal(v), n)
+    q = opc['quantum']
+    if q is not None:
+        return truncar_q(Decimal(v), q)
     # Sin decimales definidos: solo se quitan los ceros finales
     return quitar_ceros_finales(v)
 
@@ -343,7 +388,8 @@ def construir_plan(columnas, opc):
     for titulo, origen, fn in definicion:
         if origen not in pos:
             raise ValueError("falta la columna %s en la linea AARCOL" % origen)
-        plan.append((titulo, pos[origen], fn))
+        # fmt_texto no hace nada: se marca como None para copiar directo
+        plan.append((titulo, pos[origen], None if fn is fmt_texto else fn))
     return plan
 
 
@@ -384,16 +430,25 @@ def procesar_archivo(ruta_in, ruta_out, opc, det):
     """
     ruta_tmp = ruta_out + '.tmp'
     meta = datos_del_nombre(os.path.basename(ruta_in), opc)
+    convertir = opc['convertir']
+    tipo_cambio = opc['tipo_cambio']
+    quantum = opc['quantum']
+
     f_in = open(ruta_in, 'rb')
     f_out = None
     writer = None
+    bloque = []
     plan = []
+    plan_ops = []           # [(indice_origen, funcion_o_None)]
+    pos_monto_salida = -1   # posicion de AMOUNT dentro de la fila de salida
     num_cols = 0
     escritos = 0
     convertidos = 0
     idx_monto = idx_mon = idx_cod = None
     declarado = None
     primera = True
+    cache_cod = {}          # codigo crudo -> (cod, es_excepcion)
+    cache_det = {}          # (cod, moneda) -> acumulador del detalle
 
     try:
         for fila in csv.reader(f_in):
@@ -410,7 +465,8 @@ def procesar_archivo(ruta_in, ruta_out, opc, det):
                 columnas = fila[1:]
                 num_cols = len(columnas)
                 plan = construir_plan(columnas, opc)
-                if opc['convertir']:
+                plan_ops = [(p[1], p[2]) for p in plan]
+                if convertir:
                     pos = dict((c.strip().upper(), i) for i, c in enumerate(columnas))
                     for req in ('AMOUNT', 'CURRENCY', 'RATING_COMPONENT'):
                         if req not in pos:
@@ -418,7 +474,11 @@ def procesar_archivo(ruta_in, ruta_out, opc, det):
                     idx_monto = pos['AMOUNT']
                     idx_mon = pos['CURRENCY']
                     idx_cod = pos['RATING_COMPONENT']
-                f_out = open(ruta_tmp, 'wb')
+                    pos_monto_salida = -1
+                    for j, (i, fn) in enumerate(plan_ops):
+                        if i == idx_monto:
+                            pos_monto_salida = j
+                f_out = open(ruta_tmp, 'wb', BUFFER_ARCHIVO)
                 writer = csv.writer(f_out, delimiter=opc['separador'], lineterminator='\n')
                 writer.writerow([p[0] for p in plan])
 
@@ -435,29 +495,37 @@ def procesar_archivo(ruta_in, ruta_out, opc, det):
                 if len(datos) < num_cols:
                     datos = datos + [''] * (num_cols - len(datos))
                 monto_txt = None
-                if opc['convertir']:
-                    n_reg = escritos + 1
+                if convertir:
                     moneda = datos[idx_mon].strip().upper()
-                    if moneda not in ('USD', 'GTQ'):
+                    if moneda != 'USD' and moneda != 'GTQ':
                         raise ValueError("moneda no reconocida '%s' en el registro %d "
-                                         "(solo USD o GTQ)" % (moneda, n_reg))
-                    cod = sin_ceros_izq(datos[idx_cod])
-                    cod_num = int(cod) if cod.isdigit() else -1
+                                         "(solo USD o GTQ)" % (moneda, escritos + 1))
+                    cod_crudo = datos[idx_cod]
+                    info = cache_cod.get(cod_crudo)
+                    if info is None:
+                        cod = sin_ceros_izq(cod_crudo)
+                        cod_num = int(cod) if cod.isdigit() else -1
+                        info = (cod, es_excepcion(meta, cod_num, opc))
+                        cache_cod[cod_crudo] = info
+                    cod = info[0]
                     v = datos[idx_monto].strip()
-                    clave = (meta[0], meta[1], meta[2], cod, moneda)
-                    d = det.setdefault(clave, [0, 0, 0, 0])
+                    clave_c = (cod, moneda)
+                    d = cache_det.get(clave_c)
+                    if d is None:
+                        d = det.setdefault((meta[0], meta[1], meta[2], cod, moneda),
+                                           [0, 0, 0, 0])
+                        cache_det[clave_c] = d
                     d[0] += 1
-                    if es_excepcion(meta, cod_num, opc):
+                    if info[1]:
                         # Ya viene en quetzales desde ICT: no se altera
                         monto_txt = quitar_ceros_finales(v) if _es_numero(v) else v
                         d[2] += 1
                     elif moneda == 'USD':
                         try:
-                            monto_txt = truncar(Decimal(v) * opc['tipo_cambio'],
-                                                opc['dec_monto'])
+                            monto_txt = truncar_q(Decimal(v) * tipo_cambio, quantum)
                         except Exception:
                             raise ValueError("monto no numerico '%s' en el registro %d"
-                                             % (v, n_reg))
+                                             % (v, escritos + 1))
                         d[1] += 1
                         convertidos += 1
                     else:
@@ -465,18 +533,23 @@ def procesar_archivo(ruta_in, ruta_out, opc, det):
                         monto_txt = quitar_ceros_finales(v) if _es_numero(v) else v
                         d[3] += 1
                     datos[idx_mon] = 'GTQ'
-                salida = []
-                for titulo, i, fn in plan:
-                    if monto_txt is not None and i == idx_monto:
-                        salida.append(monto_txt)
-                    else:
-                        salida.append(fn(datos[i], opc) if fn else datos[i])
-                writer.writerow(salida)
+
+                salida = [datos[i] if fn is None else fn(datos[i], opc)
+                          for i, fn in plan_ops]
+                if monto_txt is not None and pos_monto_salida >= 0:
+                    salida[pos_monto_salida] = monto_txt
+                bloque.append(salida)
                 escritos += 1
+                if len(bloque) >= BLOQUE_FILAS:
+                    writer.writerows(bloque)
+                    bloque = []
             # AARHDR, AARTAB, AARSIZ, AARTYP, AARDEC, AARTRA: se ignoran
 
         if writer is None:
             raise ValueError("no se encontro la linea AARCOL con los nombres de columna")
+        if bloque:
+            writer.writerows(bloque)
+            bloque = []
     except Exception:
         f_in.close()
         if f_out is not None:
@@ -487,81 +560,168 @@ def procesar_archivo(ruta_in, ruta_out, opc, det):
 
     f_in.close()
     f_out.close()
+    if os.path.exists(ruta_out):
+        # En Windows os.rename falla si el destino existe (sobrescribir = si)
+        os.remove(ruta_out)
     os.rename(ruta_tmp, ruta_out)
     return escritos, declarado, convertidos
 
 
 # ----------------------------------------------------------------------------
-# Recorrido de carpetas
+# Trabajador (corre en cada proceso del Pool)
 # ----------------------------------------------------------------------------
-def procesar_raiz(entrada, opc, log, est):
-    """Recorre una carpeta de entrada (con subcarpetas) y escribe en SALIDA."""
+def _iniciar_trabajador(opc):
+    global _OPC
+    _OPC = opc
+
+
+def trabajar(tarea):
+    """
+    Procesa un archivo. Nunca lanza excepciones (se devuelven como resultado).
+    Devuelve:
+      ('ok', escritos, declarado, convertidos, det_local)
+      ('nocdr', mensaje)
+      ('err', mensaje)
+    """
+    ruta_in, ruta_out, destino_dir = tarea
+    det = {}
+    try:
+        if not os.path.isdir(destino_dir):
+            try:
+                os.makedirs(destino_dir)
+            except OSError:
+                # otro proceso pudo crearla al mismo tiempo
+                if not os.path.isdir(destino_dir):
+                    raise
+        escritos, declarado, convertidos = procesar_archivo(ruta_in, ruta_out, _OPC, det)
+        return ('ok', escritos, declarado, convertidos, det)
+    except NoEsCDR as e:
+        return ('nocdr', str(e))
+    except Exception as e:
+        return ('err', str(e))
+
+
+# ----------------------------------------------------------------------------
+# Planificacion: recorre carpetas y arma la lista ordenada de pasos
+# ----------------------------------------------------------------------------
+def planificar(opc):
+    """
+    Devuelve la lista ordenada de pasos a registrar/procesar:
+      ('error_ruta', entrada, mensaje)
+      ('excluida', ruta_mostrada)
+      ('carpeta', nombre_carpeta, n_archivos)
+      ('archivo', nombre, etiqueta, ruta_in, ruta_out, destino_dir, omitir_existe)
+    """
+    items = []
     salida = opc['salida']
-    # Con varias entradas, cada una va en su propia carpeta dentro de SALIDA
-    prefijo = os.path.basename(entrada) if opc['envolver'] else ''
-    destino_base = os.path.join(salida, prefijo) if prefijo else salida
+    extensiones = opc['extensiones']
+    excluir = opc['excluir']
 
-    if not os.path.isdir(entrada):
-        msg = "la carpeta de entrada no existe: %s" % entrada
-        log.escribir("[%s] ERROR %s" % (hora(), msg))
-        est['errores'].append((entrada, msg))
-        return
-    if entrada == salida:
-        msg = "entrada y salida no pueden ser la misma carpeta: %s" % entrada
-        log.escribir("[%s] ERROR %s" % (hora(), msg))
-        est['errores'].append((entrada, msg))
-        return
+    for entrada in opc['entradas']:
+        # Con varias entradas, cada una va en su propia carpeta dentro de SALIDA
+        prefijo = os.path.basename(entrada) if opc['envolver'] else ''
+        destino_base = os.path.join(salida, prefijo) if prefijo else salida
 
-    for raiz, dirs, archivos in os.walk(entrada):
-        rel = os.path.relpath(raiz, entrada)
-        rel = '' if rel == '.' else rel
-        if prefijo and rel:
-            rel_total = os.path.join(prefijo, rel)
-        else:
-            rel_total = prefijo or rel
-        nombre_carpeta = rel_total if rel_total else '(raiz de entrada)'
-
-        # Carpetas excluidas por config (se informan y no se recorren)
-        for d in sorted(dirs):
-            if d.upper() in opc['excluir']:
-                log.escribir("[%s] EXCLUIDA por config: %s" %
-                             (hora(), os.path.join(rel_total, d) if rel_total else d))
-        dirs[:] = sorted([d for d in dirs
-                          if d.upper() not in opc['excluir']
-                          and os.path.normpath(os.path.join(raiz, d)) != salida])
-
-        destino_dir = os.path.join(destino_base, rel) if rel else destino_base
-
-        candidatos = [n for n in sorted(archivos)
-                      if os.path.splitext(n)[1].lower() in opc['extensiones']]
-        if not candidatos:
+        if not os.path.isdir(entrada):
+            items.append(('error_ruta', entrada,
+                          "la carpeta de entrada no existe: %s" % entrada))
+            continue
+        if entrada == salida:
+            items.append(('error_ruta', entrada,
+                          "entrada y salida no pueden ser la misma carpeta: %s" % entrada))
             continue
 
-        log.escribir("-" * 70)
-        log.escribir("Carpeta: %s  (%d archivos)" % (nombre_carpeta, len(candidatos)))
-        log.escribir("-" * 70)
+        for raiz, dirs, archivos in os.walk(entrada):
+            rel = os.path.relpath(raiz, entrada)
+            rel = '' if rel == '.' else rel
+            if prefijo and rel:
+                rel_total = os.path.join(prefijo, rel)
+            else:
+                rel_total = prefijo or rel
+            nombre_carpeta = rel_total if rel_total else '(raiz de entrada)'
 
-        ok_carpeta = 0
-        reg_carpeta = 0
+            # Carpetas excluidas por config (se informan y no se recorren)
+            for d in sorted(dirs):
+                if d.upper() in excluir:
+                    items.append(('excluida',
+                                  os.path.join(rel_total, d) if rel_total else d))
+            dirs[:] = sorted([d for d in dirs
+                              if d.upper() not in excluir
+                              and os.path.normpath(os.path.join(raiz, d)) != salida])
 
-        for nombre in candidatos:
-            ruta_in = os.path.join(raiz, nombre)
-            etiqueta = os.path.join(rel_total, nombre) if rel_total else nombre
+            destino_dir = os.path.join(destino_base, rel) if rel else destino_base
 
-            # El archivo de salida conserva el nombre del archivo de entrada
-            aviso = ''
-            ruta_out = os.path.join(destino_dir, nombre)
+            candidatos = [n for n in sorted(archivos)
+                          if os.path.splitext(n)[1].lower() in extensiones]
+            if not candidatos:
+                continue
 
-            if os.path.exists(ruta_out) and not opc['sobrescribir']:
+            items.append(('carpeta', nombre_carpeta, len(candidatos)))
+            for nombre in candidatos:
+                ruta_in = os.path.join(raiz, nombre)
+                etiqueta = os.path.join(rel_total, nombre) if rel_total else nombre
+                # El archivo de salida conserva el nombre del archivo de entrada
+                ruta_out = os.path.join(destino_dir, nombre)
+                omitir = (not opc['sobrescribir']) and os.path.exists(ruta_out)
+                items.append(('archivo', nombre, etiqueta, ruta_in, ruta_out,
+                              destino_dir, omitir))
+    return items
+
+
+# ----------------------------------------------------------------------------
+# Consumo de resultados (solo el proceso principal escribe el log)
+# ----------------------------------------------------------------------------
+def sumar_detalle(total, parcial):
+    for clave, valores in parcial.items():
+        d = total.get(clave)
+        if d is None:
+            total[clave] = list(valores)
+        else:
+            for k in range(4):
+                d[k] += valores[k]
+
+
+def consumir(items, resultados, opc, log, est):
+    """Registra los pasos en orden, tomando del iterador el resultado de cada archivo."""
+    actual = [None, 0, 0]   # nombre_carpeta, ok_carpeta, reg_carpeta
+
+    def cerrar_carpeta():
+        if actual[0] is not None and actual[1]:
+            est['por_carpeta'].append([actual[0], actual[1], actual[2]])
+        actual[0], actual[1], actual[2] = None, 0, 0
+
+    for item in items:
+        tipo = item[0]
+
+        if tipo == 'error_ruta':
+            log.escribir("[%s] ERROR %s" % (hora(), item[2]))
+            est['errores'].append((item[1], item[2]))
+
+        elif tipo == 'excluida':
+            log.escribir("[%s] EXCLUIDA por config: %s" % (hora(), item[1]))
+
+        elif tipo == 'carpeta':
+            cerrar_carpeta()
+            actual[0] = item[1]
+            log.escribir("-" * 70)
+            log.escribir("Carpeta: %s  (%d archivos)" % (item[1], item[2]))
+            log.escribir("-" * 70)
+
+        elif tipo == 'archivo':
+            _, nombre, etiqueta, ruta_in, ruta_out, destino_dir, omitir = item
+
+            if omitir:
                 log.escribir("[%s] OMIT  %s (ya existe en salida)" % (hora(), nombre))
                 est['omit'] += 1
                 continue
 
-            try:
-                if not os.path.isdir(destino_dir):
-                    os.makedirs(destino_dir)
-                escritos, declarado, convertidos = procesar_archivo(
-                    ruta_in, ruta_out, opc, est['det'])
+            res = resultados.next(9999999)   # con timeout para poder interrumpir con Ctrl+C
+            estado = res[0]
+
+            if estado == 'ok':
+                escritos, declarado, convertidos, det_local = res[1:]
+                sumar_detalle(est['det'], det_local)
+                aviso = ''
                 if opc['convertir']:
                     aviso += '  [%d de %d registros convertidos USD->GTQ]' % (convertidos, escritos)
                     est['conv'] += convertidos
@@ -574,20 +734,22 @@ def procesar_raiz(entrada, opc, log, est):
                              (hora(), nombre, escritos, aviso))
                 est['ok'] += 1
                 est['reg'] += escritos
-                ok_carpeta += 1
-                reg_carpeta += escritos
-            except NoEsCDR as e:
-                log.escribir("[%s] OMIT  %s (%s)" % (hora(), nombre, e))
+                actual[1] += 1
+                actual[2] += escritos
+            elif estado == 'nocdr':
+                log.escribir("[%s] OMIT  %s (%s)" % (hora(), nombre, res[1]))
                 est['omit'] += 1
-            except Exception as e:
-                log.escribir("[%s] ERROR %s: %s" % (hora(), nombre, e))
-                est['errores'].append((etiqueta, str(e)))
+            else:
+                log.escribir("[%s] ERROR %s: %s" % (hora(), nombre, res[1]))
+                est['errores'].append((etiqueta, res[1]))
                 est['err'] += 1
 
-        if ok_carpeta:
-            est['por_carpeta'].append([nombre_carpeta, ok_carpeta, reg_carpeta])
+    cerrar_carpeta()
 
 
+# ----------------------------------------------------------------------------
+# Reportes
+# ----------------------------------------------------------------------------
 def escribir_detalle_moneda(log, est):
     """Detalle por franquicia/operador/sentido/transaccion/moneda y avisos."""
     det = est['det']
@@ -658,6 +820,7 @@ def ejecutar(opc, ruta_config, log):
     else:
         log.escribir("Moneda  : sin conversion")
     log.escribir("Excluye : %s" % (', '.join(opc['excluir']) if opc['excluir'] else '(ninguna)'))
+    log.escribir("Procesos: %d" % opc['procesos'])
     log.escribir("Log     : %s" % log.ruta)
     log.escribir("")
 
@@ -675,8 +838,31 @@ def ejecutar(opc, ruta_config, log):
         listo = False
 
     if listo:
-        for entrada in entradas:
-            procesar_raiz(entrada, opc, log, est)
+        items = planificar(opc)
+        tareas = [(it[3], it[4], it[5]) for it in items
+                  if it[0] == 'archivo' and not it[6]]
+
+        n_proc = min(opc['procesos'], len(tareas)) if tareas else 1
+        pool = None
+        try:
+            if n_proc > 1:
+                pool = multiprocessing.Pool(processes=n_proc,
+                                            initializer=_iniciar_trabajador,
+                                            initargs=(opc,))
+                resultados = pool.imap(trabajar, tareas, 1)   # ordenado, de 1 en 1
+            else:
+                # Modo secuencial (procesos = 1): misma ruta de codigo, sin Pool
+                _iniciar_trabajador(opc)
+                resultados = _IteradorSecuencial(tareas)
+            consumir(items, resultados, opc, log, est)
+            if pool is not None:
+                pool.close()
+                pool.join()
+        except BaseException:
+            if pool is not None:
+                pool.terminate()
+                pool.join()
+            raise
 
     fin = time.time()
 
@@ -718,6 +904,16 @@ def ejecutar(opc, ruta_config, log):
     return 1 if est['errores'] else 0
 
 
+class _IteradorSecuencial(object):
+    """Imita pool.imap(...).next(timeout) pero procesando en el mismo proceso."""
+
+    def __init__(self, tareas):
+        self.it = iter(tareas)
+
+    def next(self, timeout=None):
+        return trabajar(next(self.it))
+
+
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     ruta_config = sys.argv[1] if len(sys.argv) > 1 else os.path.join(base_dir, 'config.txt')
@@ -745,4 +941,5 @@ def main():
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()   # necesario en Windows (spawn / .exe)
     sys.exit(main())
